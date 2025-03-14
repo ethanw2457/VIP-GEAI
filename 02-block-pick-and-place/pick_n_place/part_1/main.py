@@ -1,34 +1,33 @@
-# """ =================================================
-# Copyright (C) 2018 Vikash Kumar
-# Adapted by Raghava Uppuluri for GE-AI Course
-# Author  :: Vikash Kumar (vikashplus@gmail.com)
-# Source  :: https://github.com/vikashplus/robohive
-# License :: Under Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
-# ================================================= """
-
-DESC = """
-DESCRIPTION: Simple Box Pick and Place \n
-HOW TO RUN:\n
-    - Ensure poetry shell is activated \n
-    - python3 main.py \n
+#!/usr/bin/env python3
+"""
+=================================================
+Copyright (C) 2018 Vikash Kumar
+Adapted by Raghava Uppuluri for GE-AI Course
+=================================================
 """
 
 from robohive.physics.sim_scene import SimScene
 from robohive.utils.inverse_kinematics import qpos_from_site_pose
-from robohive.utils.min_jerk import *
+from robohive.utils.min_jerk import generate_joint_space_min_jerk
 from robohive.utils.quat_math import euler2quat, quat2mat, mat2quat
 from pick_n_place.utils.xml_utils import replace_simhive_path
 
 from pathlib import Path
-
 import click
 import numpy as np
 
+# Constants for bin and arm
 BIN_POS = np.array([0.235, 0.5, 0.85])
 BIN_DIM = np.array([0.2, 0.3, 0])
 BIN_TOP = 0.10
 ARM_nJnt = 7
 
+DESC = """
+DESCRIPTION: Simple Box Pick and Place
+HOW TO RUN:
+    - Ensure poetry shell is activated
+    - python3 main.py
+"""
 
 @click.command(help=DESC)
 @click.option(
@@ -47,77 +46,201 @@ def main(sim_path, horizon):
     print(f"Loading {sim_xml}")
     sim = SimScene.get_sim(model_handle=sim_xml)
 
-    # setup
+    # Setup simulation sites and bodies
     target_sid = sim.model.site_name2id("drop_target")
     box_sid = sim.model.body_name2id("box")
     eef_sid = sim.model.site_name2id("end_effector")
+    # The pick target is defined in the XML as "pick_target"
+    start_sid = sim.model.site_name2id("pick_target")
 
+    # Initial joint configuration (home pose)
     ARM_JNT0 = np.mean(sim.model.jnt_range[:ARM_nJnt], axis=-1)
 
     while True:
-        # Update targets
         if sim.data.time == 0:
-            print("Resamping new target")
-            # Sample random place targets
+            print("Resampling new target")
+            # Sample random drop target location
             target_pos = (
                 BIN_POS
-                + np.random.uniform(high=BIN_DIM, low=-1 * BIN_DIM)
+                + np.random.uniform(high=BIN_DIM, low=-BIN_DIM)
                 + np.array([0, 0, BIN_TOP])
-            )  # add some z offfset
+            )
             target_elr = np.random.uniform(high=[3.14, 0, 0], low=[3.14, 0, -3.14])
             target_quat = euler2quat(target_elr)
 
-            # ---------------- 1.1 REPLACE WITH YOUR OWN TARGETS----------------
+            # Get current box pose and pick target pose from the simulation
+            box_pos = sim.data.xpos[box_sid]
+            start_pos = sim.data.xpos[start_sid]
+            start_mat = sim.data.xmat[start_sid]
 
-            # Box pose in Global Frame
-            box_pos = sim.data.xpos[box_sid]  # cartesian position
-            box_mat = sim.data.xmat[box_sid]  # rotation matrix
-
-            # propagage targets to the sim for viz (ONLY FOR VISUALIZATION)
+            # Update drop target visualization
             sim.model.site_pos[target_sid][:] = target_pos - np.array([0, 0, BIN_TOP])
             sim.model.site_quat[target_sid][:] = target_quat
 
-            # reseed the arm for IK (ONLY FOR VISUALIZATION)
+            # Reset arm to home for IK visualization
             sim.data.qpos[:ARM_nJnt] = ARM_JNT0
             sim.forward()
-            # ---------------- 1.1 REPLACE WITH YOUR OWN TARGETS----------------
 
-            # --------------- 1.2 GENERATE FULL JOINT TRAJECTORY FOR TASK----------------
-            # IK
+            # ---------------- 1. Pre-grasp: Move above the box ----------------
             ik_result = qpos_from_site_pose(
                 physics=sim,
                 site_name="end_effector",
-                target_pos=target_pos,  # change!
-                target_quat=target_quat,  # change!
+                target_pos=box_pos + np.array([0, -0.01, 0.2]),
+                target_quat=np.array([0, 1, 0, 0]),
                 inplace=False,
                 regularization_strength=1.0,
             )
-
-            print(
-                "IK:: Status:{}, total steps:{}, err_norm:{}".format(
-                    ik_result.success, ik_result.steps, ik_result.err_norm
-                )
-            )
-
-            # generate min jerk trajectory
+            print("IK 1:", ik_result.success, ik_result.steps, ik_result.err_norm)
             waypoints = generate_joint_space_min_jerk(
                 start=ARM_JNT0,
                 goal=ik_result.qpos[:ARM_nJnt],
                 time_to_go=horizon,
                 dt=sim.model.opt.timestep,
             )
-            # --------------- 1.2 GENERATE FULL JOINT TRAJECTORY FOR TASK----------------
 
-        # propagate waypoint in sim
+            # ---------------- 2. Approach: Move to pick target ----------------
+            ik_result2 = qpos_from_site_pose(
+                physics=sim,
+                site_name="end_effector",
+                target_pos=start_pos,
+                target_quat=mat2quat(start_mat),
+                inplace=False,
+                regularization_strength=1.0,
+            )
+            waypoints2 = generate_joint_space_min_jerk(
+                start=ik_result.qpos[:ARM_nJnt],
+                goal=ik_result2.qpos[:ARM_nJnt],
+                time_to_go=horizon,
+                dt=sim.model.opt.timestep,
+            )
+
+            # ---------------- 3. Grasp: Lower to grasp the box ----------------
+            ik_result3 = qpos_from_site_pose(
+                physics=sim,
+                site_name="end_effector",
+                target_pos=start_pos - np.array([0, 0, 0.02]),
+                target_quat=mat2quat(start_mat),
+                inplace=False,
+                regularization_strength=1.0,
+            )
+            waypoints3 = generate_joint_space_min_jerk(
+                start=ik_result2.qpos[:ARM_nJnt],
+                goal=ik_result3.qpos[:ARM_nJnt],
+                time_to_go=horizon,
+                dt=sim.model.opt.timestep,
+            )
+
+            # ---------------- 4. Lift: Raise the box after grasp ----------------
+            ik_result4 = qpos_from_site_pose(
+                physics=sim,
+                site_name="end_effector",
+                target_pos=start_pos + np.array([0, 0, 0.2]),
+                target_quat=mat2quat(start_mat),
+                inplace=False,
+                regularization_strength=1.0,
+            )
+            waypoints4 = generate_joint_space_min_jerk(
+                start=ik_result3.qpos[:ARM_nJnt],
+                goal=ik_result4.qpos[:ARM_nJnt],
+                time_to_go=horizon,
+                dt=sim.model.opt.timestep,
+            )
+
+            # ---------------- 5. Transit: Move above drop target ----------------
+            ik_result5 = qpos_from_site_pose(
+                physics=sim,
+                site_name="end_effector",
+                target_pos=target_pos + np.array([0, 0, 0.2]),
+                target_quat=target_quat,
+                inplace=False,
+                regularization_strength=1.0,
+            )
+            waypoints5 = generate_joint_space_min_jerk(
+                start=ik_result4.qpos[:ARM_nJnt],
+                goal=ik_result5.qpos[:ARM_nJnt],
+                time_to_go=horizon,
+                dt=sim.model.opt.timestep,
+            )
+
+            # ---------------- 6. Lower: Lower the box onto the drop target ----------------
+            ik_result6 = qpos_from_site_pose(
+                physics=sim,
+                site_name="end_effector",
+                target_pos=target_pos,
+                target_quat=target_quat,
+                inplace=False,
+                regularization_strength=1.0,
+            )
+            waypoints6 = generate_joint_space_min_jerk(
+                start=ik_result5.qpos[:ARM_nJnt],
+                goal=ik_result6.qpos[:ARM_nJnt],
+                time_to_go=horizon,
+                dt=sim.model.opt.timestep,
+            )
+
+            # ---------------- 7. Release: Retract while releasing the box ----------------
+            ik_result7 = qpos_from_site_pose(
+                physics=sim,
+                site_name="end_effector",
+                target_pos=target_pos + np.array([0, 0, 0.2]),
+                target_quat=target_quat,
+                inplace=False,
+                regularization_strength=1.0,
+            )
+            waypoints7 = generate_joint_space_min_jerk(
+                start=ik_result6.qpos[:ARM_nJnt],
+                goal=ik_result7.qpos[:ARM_nJnt],
+                time_to_go=horizon,
+                dt=sim.model.opt.timestep,
+            )
+
+            # ---------------- 8. Retract: Return to home ----------------
+            waypoints8 = generate_joint_space_min_jerk(
+                start=ik_result7.qpos[:ARM_nJnt],
+                goal=ARM_JNT0,
+                time_to_go=horizon,
+                dt=sim.model.opt.timestep,
+            )
+            # ---------------- End of trajectory generation ----------------
+
+        # Propagate the waypoints in simulation based on the elapsed time
         waypoint_ind = int(sim.data.time / sim.model.opt.timestep)
-        sim.data.ctrl[:ARM_nJnt] = waypoints[waypoint_ind]["position"]
+        total_steps = int(horizon / sim.model.opt.timestep)
+        if waypoint_ind < total_steps:
+            sim.data.ctrl[:ARM_nJnt] = waypoints[waypoint_ind]["position"]
+            sim.data.ctrl[-1] = 1  # gripper open
+        elif waypoint_ind < 2 * total_steps:
+            sim.data.ctrl[:ARM_nJnt] = waypoints2[waypoint_ind - total_steps]["position"]
+            sim.data.ctrl[-1] = 1
+        elif waypoint_ind < 3 * total_steps:
+            sim.data.ctrl[:ARM_nJnt] = waypoints3[waypoint_ind - 2 * total_steps]["position"]
+            sim.data.ctrl[-1] = 0
+            sim.data.ctrl[-2] = 0  # close gripper
+        elif waypoint_ind < 4 * total_steps:
+            sim.data.ctrl[:ARM_nJnt] = waypoints4[waypoint_ind - 3 * total_steps]["position"]
+            sim.data.ctrl[-1] = 0
+        elif waypoint_ind < 5 * total_steps:
+            sim.data.ctrl[:ARM_nJnt] = waypoints5[waypoint_ind - 4 * total_steps]["position"]
+            sim.data.ctrl[-1] = 0
+        elif waypoint_ind < 6 * total_steps:
+            sim.data.ctrl[:ARM_nJnt] = waypoints6[waypoint_ind - 5 * total_steps]["position"]
+            sim.data.ctrl[-1] = 0
+        elif waypoint_ind < 7 * total_steps:
+            sim.data.ctrl[:ARM_nJnt] = waypoints7[waypoint_ind - 6 * total_steps]["position"]
+            sim.data.ctrl[-1] = 0.4
+            sim.data.ctrl[-2] = 0.4
+        else:
+            sim.data.ctrl[:ARM_nJnt] = waypoints8[waypoint_ind - 7 * total_steps]["position"]
+            sim.data.ctrl[-1] = 0.4
+
         sim.advance(render=True)
 
-        # reset time if horizon elapsed
-        if sim.data.time > horizon:
-            # UPDATE ^ 'horizon' to the horizon for all the trajectories combined
+        # After all segments are executed, check error and reset simulation.
+        if sim.data.time > 8 * horizon:
+            box_pos = sim.data.xpos[box_sid]
+            distance = np.linalg.norm(target_pos - box_pos)
+            print(f"Error distance is {distance}")
             sim.reset()
-
 
 if __name__ == "__main__":
     main()
