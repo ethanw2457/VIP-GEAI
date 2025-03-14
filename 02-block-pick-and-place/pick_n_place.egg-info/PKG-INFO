@@ -1,0 +1,11 @@
+Metadata-Version: 2.2
+Name: pick-n-place
+Version: 0.0.1
+Summary: Course code for VIP-GEAI
+Home-page: https://github.com/purdue-mars/VIP-GEAI
+Author: Raghava Uppuluri
+Requires-Dist: robohive==v0.7
+Dynamic: author
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: summary
